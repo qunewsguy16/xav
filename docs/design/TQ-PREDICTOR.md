@@ -75,26 +75,81 @@ matter of running the same clip twice.
 Two tiers. They are independent: tier 1 is worth doing on its own, needs no
 persistence, and has no cold-start problem.
 
-### 2.1 Tier 1 — within-video adaptation (cheap, large win, no ML)
+### 2.1 Tier 1 — within-video adaptation
 
-Inside a single encode, the encoder, preset, parameters, target metric, target
-value, resolution and bit depth are **all constant**. The only thing varying
-between chunks is content. So after the first handful of chunks resolve, you
-already have several `(content_feature, final_crf)` pairs drawn from exactly the
-distribution you are predicting into.
+> **Correction.** An earlier draft of this section described the within-video
+> problem as easy on the grounds that "the only thing varying between chunks is
+> content", and claimed it "cannot suffer distribution shift because the
+> training and prediction sets are the same video". Both statements were wrong
+> in a way that matters. Within-video content variance is not a simplification —
+> it is the entire problem. A single per-video CRF seed would be badly wrong at
+> both tails: end credits and static title cards are trivially compressible and
+> converge at very high CRF, while high-motion or grain-heavy scenes converge
+> far lower. And a video *can* suffer covariate shift internally — credits
+> arrive at the end, after a model fitted entirely on action.
 
-- Let the first `K` chunks (K ≈ 4–8, or "until the spread is stable") run the
-  existing blind bisection.
-- Thereafter, fit a 1-D or 2-D relation over completed chunks and seed round 1
-  from it, rather than from the range midpoint.
-- Narrow the initial bracket to the fitted value ± a margin derived from the
-  observed residual spread — not a fixed constant, so a heterogeneous video
-  automatically keeps a wide bracket.
+#### Why the spread is structural, not incidental
 
-This alone should remove roughly one probe per chunk on typical content, and it
-cannot suffer distribution shift because the training and prediction sets are
-the same video. It is also the natural place to start, because it validates the
-feature set before any persistence exists.
+`chnkify` (`chunk.rs:117`) maps scenes to chunks **one-to-one**, and
+`val_scenes` (`chunk.rs:100`) rejects any scene longer than 300 frames. So a
+chunk *is* a scene. Chunks are content-homogeneous internally **by design**, and
+therefore content-*heterogeneous* between each other by the same design — a
+chunk boundary exists exactly where the content changed enough for the scene
+detector to cut.
+
+Two consequences:
+
+- **Any "neighbouring chunks are similar" heuristic is wrong here.** Chunk index
+  proximity carries almost no information about content proximity. Temporal
+  smoothing over chunk index is not a valid shortcut.
+- **What transfers within a video is the mapping, not the answer.** Scenes from
+  one source do share grain characteristics, source encoder and efficiency,
+  resolution and production style. That shared structure lives in the
+  *relationship* between complexity and CRF, not in the CRF value.
+
+#### The right decomposition
+
+Two separable wins, with different risk profiles. Worth keeping them separate
+because the first is nearly free and the second is where the difficulty is.
+
+**(a) Recentering — cheap, low risk, helps every chunk.** CRF 28 is the midpoint
+of an arbitrary user-supplied range; it has no relationship to the target metric,
+the encoder or the source. Even the *median* converged CRF for the video so far
+is a better centre than 28. If a video's chunks land in 30–45, seeding at 37
+beats seeding at 28 for every chunk, credits and action alike. This is the part
+that survives your objection intact.
+
+**(b) Conditioning — where the credits-vs-action spread is addressed.** Fit
+
+```
+crf ≈ a + b·log2(chunk_complexity)
+```
+
+with `a`, `b` learned per-video and complexity measured per-chunk. The
+per-video terms absorb grain, source efficiency and style; the per-chunk feature
+separates credits (low complexity → high CRF) from action (high complexity →
+low CRF). **The seed must be per-chunk conditional. A per-video constant is not
+an acceptable simplification.**
+
+Source bits-per-pixel for the chunk is the natural first feature and is free —
+it is a direct measurement of how many bits the *previous* encoder spent on this
+exact content. It separates credits from action about as cleanly as anything
+could.
+
+#### Bracket sizing
+
+The earlier draft said to narrow the initial bracket around the fitted value.
+That is the part of this most likely to backfire, and your objection is why:
+**a bracket narrowed around a seed that is wrong for an outlier chunk excludes
+the true answer**, forcing clamping or extrapolation and costing more rounds
+than blind bisection would have — on precisely the expensive chunks.
+
+So: size the bracket from the *observed residual spread* of the per-video fit,
+not from a fixed constant, and never narrow below the range that has actually
+contained converged answers so far. A video with a wide CRF spread should
+automatically keep a wide bracket. When in doubt, do not narrow at all — seed
+the first probe and leave the bracket alone. Seeding is where the win is;
+narrowing is a second-order optimisation with a much worse failure mode.
 
 ### 2.2 Tier 2 — cross-video model (the "self-improving" part)
 
@@ -174,10 +229,21 @@ make the search *slower* than blind bisection by much.
    target from round 1's result. Getting this wrong is the most likely way to
    make the predictor a net loss — it would convert interpolation into
    extrapolation and cost rounds on exactly the chunks the prediction got right.
-3. **Confidence gate.** Use the prediction only when the bucket has ≥ N samples
-   and residual variance is below a threshold. Otherwise fall back to bisection.
-4. **Clamp** into `[qp_min, qp_max]`, with a margin from the edges.
-5. **Poisoning.** Only feed the model chunks that actually converged in range.
+3. **Confidence gate — per chunk, not per bucket.** A bucket-level sample count
+   is not sufficient. The gate must also check that *this chunk's features* fall
+   inside the region the fit has actually seen. The concrete failure case is the
+   one that motivated the §2.1 rewrite: an action film's credits arrive at the
+   very end, so the fit has seen nothing but high-complexity scenes and the
+   credits chunk sits far outside the fitted range. Extrapolating a log-linear
+   fit that far out is worse than bisecting. So: gate on feature-space distance
+   from the observed range, and fall back to bisection for outliers rather than
+   extrapolating.
+4. **Judge on residuals, not fit quality.** A high R² over a video whose chunks
+   span 20 CRF can still mean ±5 CRF errors at the tails. The metric that
+   matters is the residual distribution — particularly its tails — not the
+   aggregate fit.
+5. **Clamp** into `[qp_min, qp_max]`, with a margin from the edges.
+6. **Poisoning.** Only feed the model chunks that actually converged in range.
    `write_chnk_log` records `in_range`/`out_range`; out-of-range chunks are
    exactly the ones whose `fc` is not a valid label.
 
@@ -207,9 +273,17 @@ in the stats output.
 
 ## 5. Honest assessment
 
-- **Tier 1 is high-confidence.** Within-video, encoder and target are fixed and
-  content is correlated across chunks. Removing ~1 probe per chunk is a realistic
-  expectation, and the risk is low.
+- **Tier 1(a), recentering, is high-confidence.** Replacing an arbitrary range
+  midpoint with the video's own observed centre is strictly better information,
+  and it helps every chunk regardless of content.
+- **Tier 1(b), conditioning, is the real work and is not yet proven.** It stands
+  or falls on whether a cheap pre-encode feature actually separates the credits
+  case from the action case well enough. It might; source bits-per-pixel is a
+  strong signal. But that is a hypothesis to measure, not an assumption to build
+  on — see step 1 of §6.
+- **Chunks are scenes, so within-video content variance is large by
+  construction** (`chnkify` is 1:1, scenes capped at 300 frames). Do not expect
+  chunk-index locality to help.
 - **Tier 2 is plausible but unproven.** The gain depends on how much of the
   variance is captured by cheap pre-encode features. Source bits-per-pixel is a
   genuinely strong signal, but source encoders vary wildly in efficiency, so a
@@ -226,11 +300,28 @@ in the stats output.
 
 ## 6. Suggested order of work
 
+**Step 0 settles the design question rather than arguing it.** Any `chunks.json`
+from a completed TQ encode already contains the per-chunk converged CRF (`fc`)
+for a whole video. Plot that distribution before writing any code:
+
+- If the within-video spread is a couple of CRF, recentering alone captures most
+  of the win and conditioning is barely worth building.
+- If it is ±8 or more — which is what the credits-vs-action argument predicts —
+  then a per-video constant is useless, conditioning is mandatory, and the
+  feature set has to be good enough to explain that spread before any of this is
+  worth shipping.
+
+That single plot is the cheapest decision point in the whole design, and it
+needs no new code. Then:
+
 1. Extract a feature vector per chunk and log it alongside the existing probe
    record. **Costs almost nothing and starts accumulating data immediately** —
    worth doing before anything else, even if the rest is deferred.
-2. Offline analysis of the resulting data to check the features actually
-   correlate with `fc`. This is the decision point for tier 2.
-3. Tier 1 within-video adaptation, behind `--tq-predict`.
-4. Persistence + bucketed ridge model (tier 2), shadow mode first.
-5. Measure on a fixed corpus; enable by default only if the numbers justify it.
+2. Offline: regress `fc` on those features *within* single videos. The question
+   is specifically whether the features explain the credits-vs-action spread —
+   check the residuals at the tails, not the aggregate fit. This is the decision
+   point for both tier 1(b) and tier 2.
+3. Tier 1(a) recentering, behind `--tq-predict`. Low risk, ship first.
+4. Tier 1(b) conditioning, only if step 2 supports it.
+5. Persistence + bucketed ridge model (tier 2), shadow mode first.
+6. Measure on a fixed corpus; enable by default only if the numbers justify it.
