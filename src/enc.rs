@@ -407,6 +407,24 @@ impl TQCtx {
         state.search_min > state.search_max
     }
 
+    /// Has the CRF/score relationship stopped behaving monotonically?
+    ///
+    /// The search assumes one direction of travel, and bails out when a probe
+    /// contradicts it, because interpolating through a non-monotonic set gives
+    /// nonsense. A repeated CRF (product exactly zero) also counts, since it
+    /// carries no new information.
+    ///
+    /// The expected sign depends on metric polarity, exactly as in
+    /// [`Self::up_bounds`]: Butteraugli is a *distortion* measure that rises
+    /// with CRF, while SSIMU2 and CVVDP are *quality* measures that fall with
+    /// it. Treating both the same way makes the normal, healthy Butteraugli
+    /// case look non-monotonic and ends the search after two probes.
+    #[inline(always)]
+    fn nonmonotonic(&self, prev: &Probe, crf: f32, score: f32) -> bool {
+        let d = (prev.crf - crf) * (prev.score - score);
+        if self.use_butter { d <= 0.0 } else { d >= 0.0 }
+    }
+
     #[inline(always)]
     fn best_probe<'a>(&self, probes: &'a [Probe]) -> &'a Probe {
         unsafe {
@@ -621,7 +639,7 @@ fn run_metric_worker(
             || tq_state
                 .probes
                 .iter()
-                .any(|p| (p.crf - crf) * (p.score - score) >= 0.0)
+                .any(|p| ctx.tq_ctx.nonmonotonic(p, crf, score))
             || ctx.tq_ctx.up_bounds(tq_state, score);
 
         tq_state.probes.push(Probe {
