@@ -330,9 +330,14 @@ pub struct ChildStdout(i32);
 pub struct ChildStderr(i32);
 #[cfg(not(target_os = "linux"))]
 pub type ChildStdin = std::process::ChildStdin;
+// Parity shims: the non-Linux `Child` is `std::process::Child`, which names its
+// own pipe types, so nothing here refers to these by our alias. Kept so the
+// module presents the same surface on both paths.
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub type ChildStdout = std::process::ChildStdout;
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub type ChildStderr = std::process::ChildStderr;
 
 #[cfg(target_os = "linux")]
@@ -408,6 +413,7 @@ impl Drop for ChildStderr {
 #[cfg(target_os = "linux")]
 pub struct ExitStatus(i32);
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub type ExitStatus = std::process::ExitStatus;
 
 #[cfg(target_os = "linux")]
@@ -426,6 +432,7 @@ pub struct Output {
     pub stderr: Vec<u8>,
 }
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub type Output = std::process::Output;
 
 #[cfg(target_os = "linux")]
@@ -433,8 +440,10 @@ pub type Output = std::process::Output;
 pub fn id() -> u32 {
     getpid() as u32
 }
+// Consumed by `y4m.rs`'s /proc/self/fd pipe detection (Linux-only) and by tests.
 #[cfg(not(target_os = "linux"))]
 #[inline]
+#[allow(dead_code)]
 pub fn id() -> u32 {
     std::process::id()
 }

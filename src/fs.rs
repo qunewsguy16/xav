@@ -449,22 +449,25 @@ pub fn read_dir<P: AsRef<Path>>(path: P) -> Result<ReadDir> {
     })
 }
 
+#[cfg(all(not(target_os = "linux"), feature = "vship"))]
+use std::fs::copy as std_copy;
 #[cfg(not(target_os = "linux"))]
 use std::fs::{
-    copy as std_copy, create_dir_all as std_create_dir_all, metadata as std_metadata,
-    read as std_read, read_dir as std_read_dir, read_link as std_read_link,
-    read_to_string as std_read_to_string, remove_dir_all as std_remove_dir_all,
-    remove_file as std_remove_file, write as std_write,
+    create_dir_all as std_create_dir_all, metadata as std_metadata, read as std_read,
+    read_dir as std_read_dir, read_link as std_read_link, read_to_string as std_read_to_string,
+    remove_dir_all as std_remove_dir_all, remove_file as std_remove_file, write as std_write,
 };
 #[cfg(not(target_os = "linux"))]
 use std::path::{Path, PathBuf};
 
 #[cfg(not(target_os = "linux"))]
-use crate::Result;
+use crate::io::Result;
 
 #[cfg(not(target_os = "linux"))]
 pub type File = std::fs::File;
+// Reached only through the TQ/vship paths on this platform.
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub type OpenOptions = std::fs::OpenOptions;
 #[cfg(not(target_os = "linux"))]
 pub type ReadDir = std::fs::ReadDir;
@@ -472,11 +475,13 @@ pub type ReadDir = std::fs::ReadDir;
 pub type DirEntry = std::fs::DirEntry;
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub fn read<P: AsRef<Path>>(path: P) -> Result<Vec<u8>> {
     std_read(path)
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub fn read_to_string<P: AsRef<Path>>(path: P) -> Result<String> {
     std_read_to_string(path)
 }
@@ -491,7 +496,9 @@ pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> Result<u64> {
     std_copy(from, to)
 }
 
+// Only consumer is `y4m.rs`'s /proc/self/fd pipe detection, which is Linux-only.
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub fn read_link<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
     std_read_link(path)
 }

@@ -3,7 +3,7 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 #[cfg(target_os = "linux")]
 use core::ffi::c_void;
 #[cfg(not(target_os = "linux"))]
-use core::ptr::from_ref;
+use core::{ptr::from_ref, sync::atomic::AtomicU32};
 use core::time::Duration;
 #[cfg(target_os = "linux")]
 use core::{
@@ -306,6 +306,22 @@ pub fn sleep(dur: Duration) {
     nanosleep(dur.as_secs() as i64, i64::from(dur.subsec_nanos()));
 }
 
+/// Per-thread park slot for the non-Linux path.
+///
+/// The progress assembly parks on this address (`PPARK` in `asm/pbf.asm`),
+/// waiting while the slot reads `PARKED`. On Linux that is a `futex` wait; on
+/// Windows `xav_plat_park` maps it onto `WaitOnAddress`. The slot must be
+/// per-thread and at a stable address, which is what the Linux side gets from
+/// its thread-local `CUR` pointer.
+#[cfg(not(target_os = "linux"))]
+#[thread_local]
+static PARK: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(not(target_os = "linux"))]
+pub fn park_state() -> *const u8 {
+    (&raw const PARK).cast()
+}
+
 #[cfg(not(target_os = "linux"))]
 pub type Thread = std::thread::Thread;
 
@@ -318,6 +334,7 @@ impl<T> JoinHandle<T> {
         self.0.join().unwrap()
     }
 
+    #[allow(dead_code)]
     pub fn thread(&self) -> Thread {
         self.0.thread().clone()
     }

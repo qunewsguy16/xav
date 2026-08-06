@@ -1,6 +1,9 @@
 use core::time::Duration;
 #[cfg(not(target_os = "linux"))]
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::OnceLock,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 #[cfg(target_os = "linux")]
 use crate::sys::{clock_mono_ns, clock_real};
@@ -9,9 +12,29 @@ use crate::sys::{clock_mono_ns, clock_real};
 #[derive(Clone, Copy)]
 pub struct Mono(u64);
 
+/// Process-wide monotonic epoch for the non-Linux path.
+///
+/// `Mono::raw` hands a bare nanosecond stamp to the progress assembly, which
+/// compares it against whatever `xav_plat_now` returns (see `plat.rs`). Both
+/// sides must therefore measure from the *same* origin, so both read this.
+/// On Linux the two agree for free because both read `CLOCK_MONOTONIC`.
+#[cfg(not(target_os = "linux"))]
+pub fn epoch() -> Instant {
+    static START: OnceLock<Instant> = OnceLock::new();
+    *START.get_or_init(Instant::now)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[inline]
+fn since_epoch_ns() -> u64 {
+    epoch().elapsed().as_nanos() as u64
+}
+
+/// Nanoseconds since [`epoch`] — same representation as the Linux variant, so
+/// `raw()` means the same thing on both paths.
 #[cfg(not(target_os = "linux"))]
 #[derive(Clone, Copy)]
-pub struct Mono(Instant);
+pub struct Mono(u64);
 
 #[cfg(target_os = "linux")]
 impl Mono {
@@ -35,12 +58,17 @@ impl Mono {
 impl Mono {
     #[inline]
     pub fn now() -> Self {
-        Self(Instant::now())
+        Self(since_epoch_ns())
     }
 
     #[inline]
     pub fn elapsed(self) -> Duration {
-        self.0.elapsed()
+        Duration::from_nanos(since_epoch_ns().saturating_sub(self.0))
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
     }
 }
 

@@ -1,14 +1,15 @@
 use alloc::{string::String, vec::Vec};
 use core::{
-    fmt::{
-        Arguments, Display, Error as FmtErr, Formatter, Result as FmtResult, Write as FmtWrite,
-        write as fmt_write,
-    },
-    mem::MaybeUninit,
-    ptr::copy_nonoverlapping,
+    fmt::{Arguments, Error as FmtErr, Result as FmtResult, Write as FmtWrite, write as fmt_write},
     result::Result as CoreResult,
     slice::from_raw_parts_mut,
     str::from_utf8,
+};
+#[cfg(target_os = "linux")]
+use core::{
+    fmt::{Display, Formatter},
+    mem::MaybeUninit,
+    ptr::copy_nonoverlapping,
 };
 #[cfg(not(target_os = "linux"))]
 use std::fs::File as StdFile;
@@ -122,6 +123,8 @@ pub trait Read {
         }
     }
 
+    // Only reached through the TQ/vship paths on non-Linux targets.
+    #[allow(dead_code)]
     fn read_to_string(&mut self, buf: &mut String) -> Result<usize> {
         let mut bytes = Vec::new();
         let n = self.read_to_end(&mut bytes)?;
