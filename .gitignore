@@ -3,6 +3,8 @@
 !/src/
 !/asm/
 !/.cargo/
+!/docs/
+!/tools/
 !/test_files/
 !.rustfmt.toml
 !build.rs
