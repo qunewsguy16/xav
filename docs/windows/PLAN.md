@@ -150,22 +150,19 @@ epoch** — not from `Instant::now()` independently, and not from `UNIX_EPOCH`. 
 hoist that `OnceLock<Instant>` into `clk.rs` and have both `Mono::now()` and
 `xav_plat_now` read it. Getting this wrong yields a plausible-looking but garbage ETA.
 
-**#7 — `park_state()` and Windows parking semantics.** `progs.rs:201` passes
-`park_state()` into the asm monitor (`xav_pb_mon`), which uses it as the address for
-`PPARK` → `xav_plat_park(addr)`. Two sub-problems:
+**#7 — `park_state()`.** `progs.rs:201` passes `park_state()` into the asm monitor
+(`xav_pb_mon`), which uses it as the address for `PPARK` → `xav_plat_park(addr)`. There is
+no non-Linux `park_state()`; on Linux it returns the current thread's `Arc<AtomicU32>` park
+slot from a `#[thread_local]` (`thread.rs:137`). The Windows equivalent needs a per-thread
+`AtomicU32` at a stable address.
 
-  - There is no non-Linux `park_state()`. On Linux it returns the current thread's
-    `Arc<AtomicU32>` park slot from a `#[thread_local]` (`thread.rs:137`). A Windows
-    equivalent needs a per-thread `AtomicU32` whose address is stable and whose protocol
-    matches what the asm expects.
-  - `plat.rs:57` implements `xav_plat_park` as
-    `WaitOnAddress(addr, &u32::MAX, 4, 512)`. `WaitOnAddress` returns *immediately* when
-    `*addr != compare`. The park slot normally holds `0`/`PARKED`, not `u32::MAX`, so as
-    written this degenerates into a 100 %-CPU spin on the monitor thread rather than a
-    512 ms timed park. **This needs review with the upstream author before the port is
-    called done** — it is a live bug in the existing Windows shim, not something the port
-    introduces. Flag it upstream; the workaround in the interim is to compare against the
-    actual parked sentinel.
+> **Correction.** An earlier draft of this document claimed `plat.rs:57` was buggy, on the
+> grounds that `xav_plat_park` calls `WaitOnAddress(addr, &u32::MAX, 4, 512)` while the park
+> slot holds something else — which would make `WaitOnAddress` return immediately and spin.
+> That is wrong. `asm/pbf.asm:939` defines `PARKED -1`, and `thread.rs:26` has
+> `const PARKED: u32 = u32::MAX`. The compare value *is* the parked sentinel, and the Linux
+> branch of the same macro passes the identical value to `FUTEX_WAIT`. The two paths are
+> semantically equivalent and `plat.rs` needs no change.
 
 ### 2.4 Build-system gaps (larger than the source gaps)
 
@@ -180,6 +177,42 @@ hoist that `OnceLock<Instant>` into `clk.rs` and have both `Mono::now()` and
 | `--guide` pager | `main.rs:189` `#[cfg(unix)]` `less` — Windows falls through to dumping 134 KB raw. | medium (UI) |
 | External encoders | `avmenc`, `vvencFFapp`, `x265`, `x264` are spawned by name (`encoder.rs:146,196,262,353`). Only SVT-AV1 is statically linked. These need `.exe` on `PATH` for anything but AV1. | medium |
 | Vship / TQ | Vship ships **precompiled Windows binaries and a Windows build doc** (`doc/FFVship-Windows-Compilation.md`, `make buildFFVSHIPcuda`), but XAV links `libvship.a` — a static archive, not the FFVship exe. Needs its own Windows static-lib build. | high — TQ is the headline feature |
+
+### 2.5 FFmpeg version exposure (measured)
+
+`build.sh:clone_phase` clones `https://github.com/FFmpeg/FFmpeg` with **no tag or pin**, so
+a build started today gets whatever is on master — which since 4 August 2026 means
+**FFmpeg 9.0 "Lei"** or later. That release bumps libavcodec and libavformat to the 63
+series, which normally signals struct-layout churn.
+
+That matters more than usual here, because XAV does not just call the FFmpeg API — it pokes
+raw byte offsets into an opaque `AVCodecContext`:
+
+```rust
+src/ffms.rs:59    const HW_DEVICE_CTX_OFFSET: usize = 560;   // -> hw_device_ctx
+src/ffms.rs:398   const THREAD_COUNT_OFFSET:  usize = 656;   // -> thread_count
+src/ffms.rs:400   ...add(HW_DEVICE_CTX_OFFSET).cast::<*mut c_void>().write_unaligned(buf_ref)
+```
+
+If a release reorders that struct, these writes land on the **wrong field**. There is no
+compile error and no link error — `--hwdec` would corrupt state silently.
+
+Measured against real headers (`offsetof` compiled against each release):
+
+| FFmpeg | `sizeof(AVCodecContext)` | `hw_device_ctx` | `thread_count` |
+|---|---|---|---|
+| n7.1 | 864 | 560 | 656 |
+| n8.0 | 864 | 560 | 656 |
+| **n9.0** | **864** | **560** | **656** |
+
+Both offsets are correct for FFmpeg 9.0. The struct also contains **no `long`, `size_t` or
+`ptrdiff_t` members**, so the layout is identical under Linux LP64 and Windows LLP64 — the
+same constants are valid on both platforms.
+
+So this is not a live bug. It is an unpinned, unchecked assumption that happens to hold.
+`build.rs` now compiles a `_Static_assert` probe against the headers actually being linked
+and fails the build with an actionable message if the offsets ever move (verified in both
+directions). The dependency-pinning manifest in §7.3 is the complementary half.
 
 ---
 
@@ -571,31 +604,135 @@ the fallback with zero downtime, and the wizard (Tier 1) works in both.
 
 ---
 
-## 9. Immediate next actions
+## 9. Decisions taken
 
-**When you're home:**
+| Decision | Choice |
+|---|---|
+| Route | **WSL2 first, then native** (§3) |
+| UI | **Tier 1 wizard + Tier 2a hand-rolled Win32 GUI** (§6) |
+| Upstreaming | **Keep in this fork.** Upstream is resistant to outside PRs, so the port is maintained here — see §10 |
 
-1. Run `tools/windows/probe-xav-system.ps1` (elevated) and send me
-   `xav-probe-report.txt`. Everything in §5 gets replaced with real numbers rather than
-   ranges.
-2. Answer the three decisions below.
+---
 
-**Decisions I need:**
+## 10. Fork maintenance strategy
 
-- **Route** — WSL2 first then native (recommended), native only, or WSL2 only?
-- **UI tier** — Tier 1 wizard only, Tier 1 + Win32 GUI (2a, ethos-matching), or
-  Tier 1 + WebView2 GUI (2b, faster/prettier)?
-- **Upstreaming** — should the Windows port fixes go to `emrakyz/xav` as a PR, or stay in
-  this fork?
+Upstream is very active (15 commits in the recent window, including active Windows work)
+and does not take outside PRs. So this fork has to absorb upstream continuously while
+carrying a permanent delta, with no prospect of the delta ever being upstreamed away. That
+changes how the port should be written.
 
-**What I can start on before you're home** (no hardware knowledge required):
+### 10.1 Principles
 
-- The 6 mechanical source fixes (§2.3 #1–5) — verifiable right now by cross-compiling
-- The `clk.rs` epoch fix (§2.3 #6)
-- `build.rs` `HOME`/`USERPROFILE` cascade
-- Console VT/UTF-8 init and the `--guide` pager fallback
-- `--progress machine` output mode (unblocks any GUI)
-- The Tier 1 wizard
+1. **Minimise diff surface in upstream-owned files.** Every line changed in `enc.rs`,
+   `fs.rs`, `io.rs` etc. is a future merge conflict. Prefer additive changes in
+   *new* files, and in shared files prefer the smallest possible edit — this is why the
+   dead-code shims got a one-line `#[allow]` each rather than being restructured or
+   deleted, and why `chunk.rs` got an import change rather than a `pub use` in `io.rs`.
+2. **Push platform code into platform files.** `src/platform/windows.rs` and `src/plat.rs`
+   are already Windows-only and upstream touches them rarely. Console init went there, not
+   into `main.rs`; `main.rs` got two `#[cfg(windows)]` call sites and nothing more.
+3. **New features live in new modules.** The wizard and the TQ predictor should be new
+   files with a single-line registration in `main.rs`, so a rebase touches one line.
+4. **Never reformat.** `.rustfmt.toml` is upstream's; running a different formatter or
+   re-wrapping untouched code would manufacture conflicts across the whole tree.
+5. **Match upstream's idiom exactly** — `_ = expr` not `let _ = expr`, no `pub use`, direct
+   FFI rather than wrappers. Code that looks native to the file merges more cleanly and is
+   easier to re-apply by hand when it doesn't.
 
-Say the word and I'll start with those; they're all Linux-build-neutral and independently
-useful.
+### 10.2 Mechanics
+
+- **Branch layout.** `main` tracks upstream verbatim — never commit to it. All work lives
+  on topic branches merged into an integration branch. Then upstream sync is
+  `git fetch upstream && git rebase upstream/main` on each topic branch, and conflicts are
+  scoped to one concern at a time instead of one giant blob.
+- **Add the upstream remote** (it is not currently configured — `origin` is the fork):
+  `git remote add upstream https://github.com/emrakyz/xav`
+- **Keep commits thematic and self-describing.** When a rebase conflicts badly, a commit
+  whose message explains *why* the change exists can be re-implemented against the new
+  code; a commit that only says what it changed cannot.
+- **The verification harness is the safety net.** Ten configurations —
+  {Linux, windows-gnu, windows-msvc} × {AVX-512, AVX2} × {TQ, no-TQ} plus clippy — must
+  pass after every upstream sync. Without it, a silently broken rebase is undetectable
+  until runtime. This is worth committing into the repo as `tools/verify.sh`.
+- **Track the clippy baseline count on the Windows target.** Clippy has never linted
+  `plat.rs` / `platform/windows.rs` upstream (they are `cfg`'d out on Linux), so there are
+  44 pre-existing findings there. Gate on that number not *growing*, rather than trying to
+  drive it to zero — fixing them all would be a large diff in upstream-owned files for no
+  functional gain.
+- **Pin the dependency commits.** `build.sh` clones `HEAD` of FFmpeg, dav1d, opus, SVT-AV1
+  and Vship. Combined with the ABI coupling in §2.5, that makes builds non-reproducible and
+  breakage non-attributable. A manifest of known-good commits, updated deliberately, is
+  what turns "it broke" into "it broke when I moved FFmpeg".
+
+### 10.3 The rebase-risk ranking of the current delta
+
+| Change | File owner | Conflict risk |
+|---|---|---|
+| `init_console` / `restore_console` | Windows-only file | very low |
+| `clk::epoch`, `Mono::raw` | shared, but in `cfg(not(linux))` blocks | low |
+| `park_state` | shared, additive | low |
+| `#[allow(dead_code)]` shims | shared, one line each | low |
+| `page_with` refactor | `main.rs` | medium — `print_guide` is upstream-owned |
+| `enc.rs` `mut cmd` | `enc.rs` is very actively edited | medium |
+| `build.rs` deps root + ABI guard | `build.rs` | medium |
+
+Nothing is high-risk today. The wizard and TQ predictor should be built to keep it that
+way.
+
+---
+
+## 11. TQ first-guess prediction
+
+Separate design doc: **`docs/design/TQ-PREDICTOR.md`**.
+
+Summary of the finding that motivates it: `tq_search_crf` (`enc.rs:697`) uses
+content-blind bisection for rounds 1 and 2 — **every chunk of every video starts at CRF 28**
+for the default `--qp 8.0-48.0`, regardless of content, encoder or target. Each of those
+rounds costs a full chunk encode plus a full GPU metric pass. Rounds 3+ interpolate and are
+content-aware.
+
+The training data already exists: `write_chnk_log` (`enc.rs:1296`) writes every probe and
+every final CRF to `<workdir>/chunks.json` on every TQ encode, and `average_probes` plus a
+per-round histogram are already computed and printed, so the success metric needs no new
+instrumentation.
+
+Plan is two-tier — within-video adaptation first (no persistence, no cold start), then a
+persisted bucketed model — with a `--tq-predict off|shadow|on` flag so accuracy can be
+measured on real encodes at zero risk before anything acts on it. See the design doc for
+the feature set, the safety constraints, and an honest assessment of which parts are
+high-confidence and which are unproven.
+
+---
+
+## 12. Status
+
+### Done and verified in this branch
+
+| Item | Verification |
+|---|---|
+| All 8 source blockers (§2.3) | 10-config cross-compile matrix, all pass |
+| Second-layer dead-code errors they masked | same |
+| `clk::epoch` shared origin for `Mono::raw` / `xav_plat_now` | same |
+| Non-Linux `park_state` | same |
+| `build.rs` `XAV_DEPS`/`HOME`/`USERPROFILE` cascade | Linux build unchanged |
+| `-l:libstdc++.a` gated off Windows | — |
+| FFmpeg ABI guard | passes on real n9.0 headers; fails with the intended message when perturbed |
+| Windows console VT + UTF-8 init/restore | compiles; needs on-machine confirmation |
+| `--guide` pager fallback | compiles; needs on-machine confirmation |
+| System probe script | hand-reviewed; not executed (no PowerShell here) |
+
+**XAV now compiles for `x86_64-pc-windows-gnu` and `x86_64-pc-windows-msvc`**, with and
+without TQ, on AVX-512 and AVX2 CPU models — with Linux unchanged.
+
+### Not started
+
+- `--progress machine` output mode (prerequisite for the GUI)
+- Tier 1 wizard
+- Native dependency build (Phase 3) — needs a Windows machine
+- Win32 GUI (Tier 2a)
+- TQ predictor (§11)
+
+### Blocked on you
+
+- `xav-probe-report.txt` → replaces every range in §5 with your actual numbers
+- Confirmation that the console init and pager behave correctly on your terminal
