@@ -662,13 +662,61 @@ should surface this as a top-level choice rather than an advanced flag — see
 
 Assessed on request. Each of these alone would be sufficient to stop it.
 
-**1. There is no LCEVC encoder we can use.** The open-sourced component is
-`LCEVCdec` — the *decoder*. Encoding requires V-Nova's commercial LCEVC SDK,
-distributed via registration at `download.v-nova.com`, with the open-source
-integration patches obtained "through a V-Nova representative or by submitting
-a request". There is no royalty-free or open-source LCEVC encoder to link
-against. XAV's licence is MIT NON-AI and its stated posture is no system-side
-dependencies; a registration-gated commercial SDK is a hard mismatch.
+**1. There is no LCEVC encoder we can use — including in FFmpeg 9.0.**
+
+FFmpeg 9.0 added substantial LCEVC support, and it is easy to read it as
+encoding support. It is not. Checked against the `n9.0` tree directly:
+
+```
+configure:249    --enable-liblcevc-dec   enable LCEVC decoding via liblcevc-dec [no]
+configure:7362   require_pkg_config liblcevc_dec "lcevc_dec >= 4.0.0" ... LCEVC_CreateDecoder
+configure:4210   lcevc_filter_deps="liblcevc_dec"
+
+Changelog:  - LCEVC track muxing support in MP4 muxer
+            - LCEVC metadata bitstream filter
+            - LCEVC parser
+            - LCEVC enhancement layer exporting in MPEG-TS
+            - LCEVC enhancement data exporting in H.26x and MP4/ISOBMFF
+            - LCEVC filter
+```
+
+Every one of those is **carriage, parsing or decode**:
+
+- The only library integration is `--enable-liblcevc-**dec**`, requiring
+  `lcevc_dec >= 4.0.0` and probing for `LCEVC_CreateDecoder`. There is no
+  `--enable-liblcevc-enc` and no encoder-side option of any kind.
+- `libavcodec/Makefile` builds `lcevcdec.o lcevctab.o` under
+  `CONFIG_LIBLCEVC_DEC`, `cbs_lcevc.o` under `CONFIG_CBS_LCEVC`, and
+  `lcevc_parser.o` under `CONFIG_LCEVC_PARSER`. No encoder object exists.
+- **`allcodecs.c` contains no LCEVC entry at all** — no encoder is registered.
+  A tree-wide grep for `liblcevc_enc`, `lcevc_encoder` or `ff_lcevc_encoder`
+  returns nothing.
+- `AV_CODEC_ID_LCEVC` does exist, but only in `codec_desc.c`, the parser, CBS,
+  and the `lcevc_metadata` / `extract_extradata` bitstream filters — i.e. as an
+  identifier for an enhancement-layer stream being *handled*, not produced.
+- `cbs_lcevc` has read **and write** paths, which is the most misleading part.
+  That is bitstream *syntax* serialisation, used by the metadata BSF to rewrite
+  payloads. Producing an enhancement layer needs the actual coding tools —
+  downsample, upsample, residual computation, transform, quantisation, entropy
+  coding, and rate control against the base layer. None of that is present.
+- "Exporting" in the Changelog means extracting a layer that already exists out
+  of H.26x SEI or a container, not generating one.
+
+What FFmpeg 9.0 genuinely delivers is the **plumbing**: if you had an LCEVC
+enhancement layer produced elsewhere, FFmpeg can now parse it, filter its
+metadata, carry it in MPEG-TS, and mux it into MP4. That is real work and it
+closes a real gap — it just leaves the encoder as the missing link.
+
+Encoding still requires V-Nova's commercial LCEVC SDK, distributed via
+registration at `download.v-nova.com`, with open-source integration patches
+obtained "through a V-Nova representative or by submitting a request". The
+open-sourced component is `LCEVCdec` — the decoder. XAV's licence is MIT NON-AI
+and its stated posture is no system-side dependencies; a registration-gated
+commercial SDK is a hard mismatch.
+
+*Verified against `git clone --branch n9.0 FFmpeg/FFmpeg` on 2026-08-06. If a
+later release adds a native encoder, reason (1) goes away — but (2) and (3)
+below stand on their own.*
 
 **2. It is architecturally a large change, not a flag.** Even granted the SDK:
 
