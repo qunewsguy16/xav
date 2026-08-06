@@ -23,7 +23,7 @@ use core::{
 #[cfg(any(not(target_os = "linux"), test))]
 use std::{env::args as env_args, panic::set_hook};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::process::{Command, Stdio};
 #[cfg(all(target_os = "linux", not(test)))]
 use crate::sync::OnceLock;
@@ -170,6 +170,8 @@ extern "C" fn restore() {
         print!("\x1b[?25h\x1b[?1049l");
         _ = stdout().flush();
     }
+    #[cfg(windows)]
+    platform::restore_console();
 }
 extern "C" fn exit_restore(_: i32) {
     restore();
@@ -202,6 +204,25 @@ fn print_help() {
     println!("   {P}┃ {C}--guide      {W}Use fullscreen & Nerd Fonts");
 }
 
+/// Pipe `text` through `pager`. Returns false if it could not be started, so
+/// the caller can try the next candidate or fall back to printing.
+#[cfg(any(unix, windows))]
+fn page_with(pager: &str, text: &str) -> bool {
+    let Ok(mut child) = Command::new(pager)
+        .args(["-R", "-F", "-n"])
+        .env("LESSUTFCHARDEF", "E000-F8FF:p,F0000-FFFFD:p")
+        .stdin(Stdio::piped())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut si) = child.stdin.take() {
+        _ = si.write_all(text.as_bytes());
+    }
+    _ = child.wait();
+    true
+}
+
 fn print_guide() {
     let guide = include_str!("guide.txt")
         .replace("{G}", G)
@@ -213,17 +234,19 @@ fn print_guide() {
         .replace("{W}", W);
 
     #[cfg(unix)]
-    if let Ok(mut pager) = Command::new("less")
-        .args(["-R", "-F", "-n"])
-        .env("LESSUTFCHARDEF", "E000-F8FF:p,F0000-FFFFD:p")
-        .stdin(Stdio::piped())
-        .spawn()
-    {
-        if let Some(mut si) = pager.stdin.take() {
-            _ = si.write_all(guide.as_bytes());
-        }
-        _ = pager.wait();
+    if page_with("less", &guide) {
         return;
+    }
+
+    // Windows has no pager of its own worth using here: more.com mangles the
+    // ANSI colour the guide is written in. less.exe is common enough via Git
+    // for Windows, scoop or winget to be worth trying before giving up and
+    // dumping 130 KB into the scrollback.
+    #[cfg(windows)]
+    for pager in ["less.exe", "less"] {
+        if page_with(pager, &guide) {
+            return;
+        }
     }
 
     print!("{guide}");
@@ -803,6 +826,11 @@ fn print_sum(args: &Args, inf: &VidInf, chnks: &[Chunk], crop: (u32, u32), enc_t
 }
 
 fn run() -> Result<(), Xerr> {
+    // Before any output: the help text, the guide and the TUI all assume UTF-8
+    // and VT sequences, which a Windows console does not give us by default.
+    #[cfg(windows)]
+    platform::init_console();
+
     let args = match parse_args() {
         Ok(a) => a,
         Err(Help) => return Ok(()),

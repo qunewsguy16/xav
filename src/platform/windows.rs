@@ -4,6 +4,7 @@ use core::{
     iter::once,
     ptr::{null, null_mut},
     slice::{from_raw_parts, from_raw_parts_mut},
+    sync::atomic::{AtomicU32, Ordering::Relaxed},
 };
 use std::os::windows::ffi::OsStrExt as _;
 
@@ -130,6 +131,64 @@ unsafe extern "system" {
         transferred: *mut u32,
         wait: i32,
     ) -> i32;
+    fn GetStdHandle(which: u32) -> Handle;
+    fn GetConsoleMode(console: Handle, mode: *mut u32) -> i32;
+    fn SetConsoleMode(console: Handle, mode: u32) -> i32;
+    fn SetConsoleOutputCP(page: u32) -> i32;
+    fn SetConsoleCP(page: u32) -> i32;
+}
+
+const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
+const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+const CP_UTF8: u32 = 65001;
+
+/// Console mode as found, so it can be put back. `u32::MAX` means "not saved",
+/// which is unambiguous: no real console mode sets every reserved bit.
+static PREV_MODE: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Put the console into the state the TUI assumes: UTF-8 and VT sequences.
+///
+/// XAV drives the alternate screen and ANSI colour directly, and `guide.txt`
+/// is full of Nerd Font glyphs. Windows Terminal enables VT by default, but
+/// legacy conhost does not, and neither enables UTF-8 output -- so without
+/// this the progress display is escape-code soup and the guide is mojibake.
+/// Failures are ignored on purpose: redirected output has no console, which is
+/// not an error.
+pub fn init_console() {
+    unsafe {
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        if invalid(out) || out.is_null() {
+            return;
+        }
+        let mut mode = 0;
+        if GetConsoleMode(out, &raw mut mode) == 0 {
+            return;
+        }
+        PREV_MODE.store(mode, Relaxed);
+        SetConsoleMode(
+            out,
+            mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT,
+        );
+    }
+}
+
+/// Undo [`init_console`]. Safe to call more than once, and safe to call when
+/// init never ran -- which matters because it runs from the signal handler.
+pub fn restore_console() {
+    let prev = PREV_MODE.swap(u32::MAX, Relaxed);
+    if prev == u32::MAX {
+        return;
+    }
+    unsafe {
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        if !invalid(out) && !out.is_null() {
+            SetConsoleMode(out, prev);
+        }
+    }
 }
 
 #[link(name = "onecore")]

@@ -1,4 +1,4 @@
-use std::{env, error::Error, path::Path};
+use std::{env, error::Error, fmt::Write as _, fs, path::Path, process::Command};
 
 const SYS_PATHS: [&str; 7] = [
     "/usr/lib64",
@@ -121,10 +121,76 @@ fn build_asm() -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
+/// Root the dependency tree was built under.
+///
+/// `XAV_DEPS` wins so a Windows build (or any out-of-tree layout) can point at
+/// its own prefix; otherwise HOME on unix, USERPROFILE on Windows.
+fn deps_root() -> Result<String, Box<dyn Error + Send + Sync>> {
+    env::var("XAV_DEPS")
+        .or_else(|_e| env::var("HOME"))
+        .or_else(|_e| env::var("USERPROFILE"))
+        .map_err(|_e| {
+            "none of XAV_DEPS, HOME or USERPROFILE is set - cannot locate the built dependencies"
+                .into()
+        })
+        .map(|r| r.replace('\\', "/"))
+}
+
+/// `ffms.rs` writes `hw_device_ctx` and `thread_count` through hardcoded byte
+/// offsets into an opaque `AVCodecContext`. Those are correct for `FFmpeg` 7.1
+/// through 9.0 (measured), but nothing in the type system pins them: if a
+/// future release reorders the struct, the writes land on the wrong field and
+/// corrupt state silently, with no compile or link error.
+///
+/// So check them against the headers actually being linked. Skipped when the
+/// headers or a C compiler are unavailable, since it is a guard, not a
+/// dependency.
+fn check_ffmpeg_abi(deps: &str) {
+    const OFFSETS: [(&str, usize); 2] = [("hw_device_ctx", 560), ("thread_count", 656)];
+
+    let inc = format!("{deps}/.local/src/FFmpeg/install/include");
+    if !Path::new(&format!("{inc}/libavcodec/avcodec.h")).exists() {
+        return;
+    }
+    let Ok(out) = env::var("OUT_DIR") else { return };
+
+    let mut src = String::from("#include <stddef.h>\n#include \"libavcodec/avcodec.h\"\n");
+    for (field, off) in OFFSETS {
+        _ = writeln!(
+            src,
+            "_Static_assert(offsetof(AVCodecContext, {field}) == {off}, \
+             \"FFmpeg ABI drift: AVCodecContext.{field} is no longer at {off}; \
+             update ffms.rs\");"
+        );
+    }
+
+    let probe = format!("{out}/xav_ffmpeg_abi.c");
+    if fs::write(&probe, src).is_err() {
+        return;
+    }
+
+    let cc = env::var("CC").unwrap_or_else(|_e| "clang".to_owned());
+    let Ok(res) = Command::new(cc)
+        .args(["-fsyntax-only", "-I", &inc, &probe])
+        .output()
+    else {
+        return;
+    };
+
+    assert!(
+        res.status.success(),
+        "FFmpeg ABI check failed against {inc}\n{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    println!("cargo:rerun-if-changed={inc}/libavcodec/avcodec.h");
+}
+
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let home = env::var("HOME")?;
+    let home = deps_root()?;
 
     build_asm()?;
+
+    check_ffmpeg_abi(&home);
 
     println!("cargo:rustc-link-search=native={home}/.local/src/FFmpeg/install/lib");
     println!("cargo:rustc-link-search=native={home}/.local/src/dav1d/build/src");
@@ -175,7 +241,11 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             println!("cargo:rustc-link-lib=dylib=cuda");
         }
 
-        println!("cargo:rustc-link-arg=-l:libstdc++.a");
+        // GNU-ld spelling; link.exe on the MSVC target does not understand it,
+        // and the MinGW C++ runtime is pulled in by the driver anyway.
+        if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+            println!("cargo:rustc-link-arg=-l:libstdc++.a");
+        }
     }
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
