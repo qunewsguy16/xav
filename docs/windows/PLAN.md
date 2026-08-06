@@ -484,12 +484,19 @@ independently and in order of value-per-hour.
 - Input: typed, or **dragged onto the console window** (Windows quotes the path; XAV
   already has `parse_quoted_args`, `main.rs:520`).
 - Probes the file (`get_vidinf`) and reports resolution, bit depth, codec, duration.
+- **Codec is a top-level question, asked every time, defaulting to the last choice** —
+  *"H.265 (10-bit, x265) / AV1 (SVT-AV1)"*, with `avm`/`vvenc`/`x264` behind "more".
+  Per §9a this is a per-video decision, not a global setting, and it should never be
+  buried in an advanced panel. Both paths are software-only; there is no hardware
+  encoder to accidentally select.
 - Asks intent in plain language — *"Archive quality / Balanced / Small file / Match a
-  quality target"* — mapping to encoder, CRF or `--tq`, and preset.
+  quality target"* — mapping to CRF or `--tq`, and preset.
 - **Computes `-w`, `--lp` and `-b` itself** from `available_parallelism()`, detected RAM,
   and the frame-size formula in §5.2. This is the single most valuable thing the UI can do:
   it is the hardest parameter to get right and the one where the guide says *"experimentation
-  needed"*.
+  needed"*. Note the rule differs by codec — for x265 there is no internal threading to
+  trade against, so it should scale workers up to the RAM ceiling rather than balancing
+  against `--lp` the way SVT-AV1 does (§9a).
 - Prints the exact equivalent command line before running — the wizard teaches the CLI
   rather than hiding it.
 - Presets saved to `%APPDATA%\xav\presets\<name>` in the **existing** saved-args format
@@ -611,6 +618,104 @@ the fallback with zero downtime, and the wizard (Tier 1) works in both.
 | Route | **WSL2 first, then native** (§3) |
 | UI | **Tier 1 wizard + Tier 2a hand-rolled Win32 GUI** (§6) |
 | Upstreaming | **Keep in this fork.** Upstream is resistant to outside PRs, so the port is maintained here — see §10 |
+
+---
+
+## 9a. Codec policy
+
+Stated requirements, and where each stands today.
+
+### Already satisfied — no work needed
+
+**H.265 must be 10-bit software.** `make_x265_cmd` (`encoder.rs:261`) already
+hardcodes `--input-depth 10 --output-depth 10 --profile main10 --input-csp 1`.
+It is 10-bit 4:2:0 end to end, and it is the `x265` binary — software.
+
+It is also tuned harder than a plain `x265 --preset slow` would be:
+`--frame-threads 1 --pools 1 --slices 1 --no-wpp --lookahead-slices 1
+--lookahead-threads 1`. Every one of those deliberately gives up *internal*
+parallelism because internal parallelism costs coding efficiency, and XAV gets
+the throughput back by running N chunks concurrently instead. Combined with
+`--rc-lookahead 250` (near-free here, because the whole chunk is already in
+memory) this is a meaningfully more efficient x265 configuration than a normal
+single-process encode. The guide's note for these flags is literally
+"Increases quality/efficiency (we parallelize externally)".
+
+Corollary for tuning: for x265 the guidance in §5.2 differs from SVT-AV1 — the
+guide says for H26x encoders *more workers is always better* up to the RAM
+limit, because there is no internal threading to trade against.
+
+**Never NVENC.** There is no hardware encode path in XAV at all. No
+`nvenc`/`amf`/`qsv` reference exists anywhere in `src/`, and `build.sh`'s
+FFmpeg configure has **no `--enable-encoder=` of any kind** — it is
+`--disable-all` plus a decoder/demuxer/parser allowlist. The only NVIDIA
+involvement is `--enable-nvdec`/`--enable-cuvid` and the `*_cuvid` decoders
+(`ffms.rs:579`), which `--hwdec` uses for **decoding only**. So `--hwdec` is
+safe to offer in the UI without any risk of touching the encode path.
+
+**AV1 or H.265 per video.** Already `-e svt-av1` / `-e x265` (also `avm`,
+`vvenc`, `x264`). Selection is per invocation, so per video. The UI work in §6
+should surface this as a top-level choice rather than an advanced flag — see
+§6.1.
+
+### LCEVC for H.265 — recommend against, for three independent reasons
+
+Assessed on request. Each of these alone would be sufficient to stop it.
+
+**1. There is no LCEVC encoder we can use.** The open-sourced component is
+`LCEVCdec` — the *decoder*. Encoding requires V-Nova's commercial LCEVC SDK,
+distributed via registration at `download.v-nova.com`, with the open-source
+integration patches obtained "through a V-Nova representative or by submitting
+a request". There is no royalty-free or open-source LCEVC encoder to link
+against. XAV's licence is MIT NON-AI and its stated posture is no system-side
+dependencies; a registration-gated commercial SDK is a hard mismatch.
+
+**2. It is architecturally a large change, not a flag.** Even granted the SDK:
+
+- XAV does not use FFmpeg to encode anything, so FFmpeg's LCEVC encoder
+  integration is unreachable without adding an entire FFmpeg-encode path that
+  does not exist today.
+- XAV spawns the stock `x265` binary. Upstream x265 has no LCEVC support;
+  V-Nova's route is a patched encoder or their own wrapper.
+- The muxer is hand-written with a fixed codec-ID table (`encoder.rs:56`,
+  `V_MPEGH/ISO/HEVC` and friends). A two-layer format needs different
+  signalling and a second bitstream carried alongside every chunk.
+- **TQ would need an LCEVC decoder in the metric loop.** Quality is measured on
+  the decoded output via Vship; for LCEVC that means decoding base *plus*
+  enhancement before measuring. This is the part most likely to be
+  underestimated — it makes LCEVC support a change to the target-quality
+  engine, not just to the encoder wrapper.
+- Chunked encoding concatenates bitstreams; the enhancement layer would need
+  the same treatment per chunk.
+
+**3. The regime is wrong, so it probably would not even help.** LCEVC's
+headline numbers come from complexity-constrained scenarios — the widely cited
+~39 % BD-rate gain over standalone x265 is measured on **live gaming at
+1080p60**. The published guidance is that ideal configurations pair LCEVC with
+*mid-speed* base presets at transmission bitrates below ~3000 kbps for 1080p60,
+and that gains show diminishing returns where the base codec is already
+efficient (x265 at ≥4000 kbps). LCEVC also runs at roughly 0.3× x265's encode
+time — the trade being bought is **speed**, not quality-at-any-cost. Reported
+VMAF-based gains are also thought to overstate the real benefit.
+
+XAV is the exact opposite operating point: maximum-effort offline encoding,
+internal threading deliberately disabled to buy efficiency, per-scene quality
+targeting, high bitrates. In that regime, spending the bits in the base layer
+is the likelier win. This is a reasoned expectation from the published
+operating ranges rather than a measurement of this specific setup — but given
+(1) and (2), it is not worth measuring.
+
+**Recommendation:** don't. If LCEVC playback compatibility ever becomes the
+actual goal rather than compression efficiency, revisit — but the requirement
+that it never be automatic already acknowledges the compatibility problem, and
+an option that is off by default, needs a commercial SDK, requires reworking
+the TQ engine, and is expected to lose on efficiency in this regime is not a
+good trade.
+
+*Sources: [Eyevinn, LCEVC-enhanced x265](https://eyevinntechnology.medium.com/will-lcevc-enhanced-x265-contribute-to-sustainability-in-streaming-47315a5be2c0);
+[SPIE, Enhancing SVT-AV1 with LCEVC](https://www.lcevc.org/wp-content/uploads/2022_SPIE_Enhancing-SVT-AV1-with-LCEVC.pdf);
+[V-Nova LCEVC SDK](https://v-nova.com/lcevc-enhanced-video/lcevc-video-sdk/);
+[V-Nova docs](https://docs.v-nova.com/technologies/mpeg-5.lcevc).*
 
 ---
 
