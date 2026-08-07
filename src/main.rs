@@ -121,6 +121,7 @@ use enc::{is_cvvdp, tq_target};
 use encoder::Encoder;
 use error::{IN_ALT_SCREEN, SIGINT, SIGSEGV, Xerr, eprint, exit, fatal, signal};
 use ffms::{DecStrat, VidDecoder, VidInf, get_dec_strat, get_vidinf, vid_bytes};
+use progs::set_machine;
 use scd::fd_scenes;
 use svterr::val;
 #[cfg(feature = "vship")]
@@ -163,6 +164,7 @@ pub struct Args {
     pub alt_param: Option<String>,
     pub sc_only: bool,
     pub hwdec: bool,
+    pub machine: bool,
 }
 
 extern "C" fn restore() {
@@ -189,6 +191,7 @@ fn print_help() {
     println!("{C}-s {P}┃ {C}--sc         {W}SCD file");
     println!("   {P}┃ {C}--sc-only    {W}Exit after SCD");
     println!("   {P}┃ {C}--hwdec      {W}GPU decode");
+    println!("   {P}┃ {C}--progress   {W}Display: {G}tui {W}(default) or {G}machine {W}(stderr records)");
     println!("{C}-r {P}┃ {C}--range      {W}Trim/splice: {G}\"10-20,90-100\"");
     println!("{C}-a {P}┃ {C}--audio      {W}Opus Enc: {Y}-a {G}\"{R}<{G}auto{P}┃{G}norm{P}┃{G}bitrate{R}> {R}<{G}all{P}┃{G}stream_ids{R}>{G}\"");
     #[cfg(feature = "vship")]
@@ -352,6 +355,7 @@ macro_rules! arg {
 
 fn parse_args_loop(args: &[String]) -> Result<Args, Xerr> {
     let (mut worker, mut chnk_buff, mut sc_only, mut hwdec) = (1usize, None, false, false);
+    let mut machine = false;
     let (mut sc_file, mut inp, mut out) = (PathBuf::new(), PathBuf::new(), PathBuf::new());
     let (mut encoder, mut params) = (Encoder::default(), String::new());
     let (mut au, mut ranges) = (None, None);
@@ -402,6 +406,15 @@ fn parse_args_loop(args: &[String]) -> Result<Args, Xerr> {
             "-P" | "--alt-param" => arg!(opt args, i, alt_param),
             "--hwdec" => hwdec = true,
             "--sc-only" => sc_only = true,
+            "--progress" => {
+                if let Some(v) = next_arg(args, &mut i) {
+                    machine = match v {
+                        "machine" => true,
+                        "tui" => false,
+                        _ => return Err(format!("Unknown progress mode: {v}").into()),
+                    };
+                }
+            }
             "-h" | "--help" => {
                 print_help();
                 return Err(Help);
@@ -435,6 +448,7 @@ fn parse_args_loop(args: &[String]) -> Result<Args, Xerr> {
         ranges,
         sc_only,
         hwdec,
+        machine,
         #[cfg(feature = "vship")]
         tq,
         #[cfg(feature = "vship")]
@@ -463,7 +477,11 @@ fn get_args(args: &[String], allow_resume: bool) -> Result<Args, Xerr> {
         return Err("Missing input".into());
     }
 
-    if allow_resume && let Ok(saved_args) = get_saved_args(&result.inp) {
+    if allow_resume && let Ok(mut saved_args) = get_saved_args(&result.inp) {
+        // Resume pins the encode parameters, but how progress is displayed is
+        // a property of this invocation, not of the encode -- a GUI resuming
+        // a run started from a terminal still needs its machine records.
+        saved_args.machine = result.machine;
         return Ok(saved_args);
     }
     if result.out != PathBuf::new() {
@@ -622,8 +640,10 @@ fn acq_au(
     inf: &VidInf,
     work_dir: &Path,
 ) -> Result<Vec<(AuStream, PathBuf)>, Xerr> {
-    print!("\x1b[H\x1b[2J");
-    _ = stdout().flush();
+    if !args.machine {
+        print!("\x1b[H\x1b[2J");
+        _ = stdout().flush();
+    }
     let samp_ranges = args.ranges.as_ref().map(|r| {
         r.iter()
             .map(|&(s, e)| {
@@ -650,9 +670,13 @@ fn val_all_scenes(scenes: &[Scene], enc: Encoder) -> Result<(), Xerr> {
 }
 
 fn main_with_args(args: &Args) -> Result<(), Xerr> {
-    print!("\x1b[?1049h\x1b[H\x1b[?25l");
-    _ = stdout().flush();
-    IN_ALT_SCREEN.store(true, Relaxed);
+    if args.machine {
+        set_machine();
+    } else {
+        print!("\x1b[?1049h\x1b[H\x1b[?25l");
+        _ = stdout().flush();
+        IN_ALT_SCREEN.store(true, Relaxed);
+    }
 
     let canon_inp = args.inp.canonicalize()?;
     let hash = hash_inp(&canon_inp);
@@ -688,8 +712,10 @@ fn main_with_args(args: &Args) -> Result<(), Xerr> {
 
     ensure_sc_file(&args, &inf, crop, 3)?;
 
-    print!("\x1b[H\x1b[2J");
-    _ = stdout().flush();
+    if !args.machine {
+        print!("\x1b[H\x1b[2J");
+        _ = stdout().flush();
+    }
 
     #[cfg(feature = "vship")]
     let tq = args.tq.is_some();

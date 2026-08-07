@@ -39,7 +39,7 @@ use crate::{
     path::Path,
     pipeline::Pipeline,
     process::Child,
-    progs::{ProgsTrack, Tracker, Watch},
+    progs::{ProgsTrack, Tracker, Watch, emit_chunk_done},
     svt::{
         EB_BUFFERFLAG_EOS, EB_ERROR_NONE, EbBufferHeaderType, EbComponentType,
         EbSvtAv1EncConfiguration, EbSvtIOFormat, svt_av1_enc_deinit, svt_av1_enc_deinit_handle,
@@ -470,6 +470,12 @@ fn complete_chnk(
     unsafe { mpsc_send(ctx.done_tx, 1) };
 
     let file_sz = metadata(&dst).unwrap_or(0);
+    emit_chunk_done(
+        chnk_idx,
+        chnk_frames,
+        file_sz,
+        Some((best.crf, best.score)),
+    );
     let comp = ChunkComp {
         idx: chnk_idx,
         frames: chnk_frames,
@@ -1199,6 +1205,7 @@ fn run_enc_worker(
                 ctx.encoder.extension()
             ));
             let file_sz = metadata(&out).unwrap_or(0);
+            emit_chunk_done(pkg.chnk.idx, pkg.frame_cnt, file_sz, None);
             let comp = ChunkComp {
                 idx: pkg.chnk.idx,
                 frames: pkg.frame_cnt,
