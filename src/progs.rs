@@ -22,7 +22,7 @@ use crate::{
     },
     error::eprint,
     ffms::VidInf,
-    io::{Read, Write as _, print_fmt, stdout as io_stdout},
+    io::{Read, Write as _, print_fmt, stderr, stdout as io_stdout},
     sync::{Guard, Mutex},
     thread::{JoinHandle, park_state, sleep, spawn},
 };
@@ -30,6 +30,64 @@ use crate::{
 const BAR_WIDTH: usize = 20;
 pub const INTERVAL_MS: u64 = 512;
 const READ_CAP: usize = 8192;
+
+static MACHINE: AtomicBool = AtomicBool::new(false);
+static EMIT_LAST: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_machine() {
+    MACHINE.store(true, Relaxed);
+}
+
+#[inline]
+pub fn machine() -> bool {
+    MACHINE.load(Relaxed)
+}
+
+/// Write one machine-readable progress record to stderr.
+///
+/// Machine mode replaces the ANSI TUI wholesale: consumers parse
+/// line-delimited `XAVP1 key=value` records off stderr, and must never see
+/// cursor movement, so every machine-mode emitter funnels through here.
+/// Best-effort on purpose -- a closed stderr must not kill an encode.
+fn emit(args: fmt::Arguments<'_>) {
+    let mut e = stderr();
+    _ = e.write_fmt(format_args!("XAVP1 {args}\n"));
+    _ = e.flush();
+}
+
+/// [`emit`], rate-limited to one record per [`INTERVAL_MS`] globally.
+///
+/// Hot paths (per-packet copy updates, per-frame audio counts) call this;
+/// terminal updates that must not be lost call [`emit`] directly.
+fn emit_throttled(args: fmt::Arguments<'_>) {
+    let now = Mono::now().raw();
+    let last = EMIT_LAST.load(Relaxed);
+    if now.wrapping_sub(last) < INTERVAL_MS * 1_000_000 {
+        return;
+    }
+    if EMIT_LAST
+        .compare_exchange(last, now, Relaxed, Relaxed)
+        .is_ok()
+    {
+        emit(args);
+    }
+}
+
+/// Chunk-completion event for machine consumers. No-op in TUI mode.
+pub fn emit_chunk_done(idx: u16, frames: usize, bytes: u64, crf_score: Option<(f32, f32)>) {
+    if !machine() {
+        return;
+    }
+    if let Some((crf, score)) = crf_score {
+        emit(format_args!(
+            "event=chunk idx={idx} frames={frames} bytes={bytes} crf={crf:.2} score={score:.4}"
+        ));
+    } else {
+        emit(format_args!(
+            "event=chunk idx={idx} frames={frames} bytes={bytes}"
+        ));
+    }
+}
 
 use crate::util::{C, G, P, R, W, Y, assume_unreachable};
 
@@ -156,6 +214,14 @@ impl ProgsBar {
     }
 
     pub fn up_frames(&mut self, current: usize, tot: usize, line: usize, label: &str) {
+        if machine() {
+            if current >= tot {
+                emit(format_args!("phase={label} cur={current} tot={tot}"));
+            } else {
+                emit_throttled(format_args!("phase={label} cur={current} tot={tot}"));
+            }
+            return;
+        }
         unsafe {
             xav_pb_frames(
                 &raw mut *self,
@@ -169,6 +235,18 @@ impl ProgsBar {
     }
 
     pub fn up_au(&mut self, current: usize, tot: usize, line: usize, pass: u8, track_id: u8) {
+        if machine() {
+            if current >= tot {
+                emit(format_args!(
+                    "phase=audio track={track_id} pass={pass} cur={current} tot={tot}"
+                ));
+            } else {
+                emit_throttled(format_args!(
+                    "phase=audio track={track_id} pass={pass} cur={current} tot={tot}"
+                ));
+            }
+            return;
+        }
         unsafe {
             xav_pb_au(
                 &raw mut *self,
@@ -182,6 +260,14 @@ impl ProgsBar {
     }
 
     pub fn up_copy(&mut self, current: usize, tot: usize) {
+        if machine() {
+            if current >= tot {
+                emit(format_args!("phase=copy cur={current} tot={tot}"));
+            } else {
+                emit_throttled(format_args!("phase=copy cur={current} tot={tot}"));
+            }
+            return;
+        }
         unsafe { xav_pb_copy(&raw mut *self, current, tot) }
     }
 }
@@ -194,6 +280,22 @@ pub fn monitor_au(
     pass: u8,
     tid: u8,
 ) {
+    if machine() {
+        // The asm monitor exists to redraw a bar; in machine mode a plain
+        // polling loop over the same counters is all that is needed.
+        while !stop.load(Relaxed) {
+            emit_throttled(format_args!(
+                "phase=audio track={tid} pass={pass} cur={} tot={tot}",
+                done.load(Relaxed)
+            ));
+            sleep(Durat::from_millis(INTERVAL_MS));
+        }
+        emit(format_args!(
+            "phase=audio track={tid} pass={pass} cur={} tot={tot}",
+            done.load(Relaxed)
+        ));
+        return;
+    }
     unsafe {
         xav_pb_mon(
             (&raw const *done).cast(),
@@ -273,8 +375,10 @@ impl ProgsTrack {
         completed_frames: Arc<AtomicUsize>,
         tot_sz: Arc<AtomicU64>,
     ) -> (Self, JoinHandle<()>) {
-        print!("\x1b[s");
-        _ = io_stdout().flush();
+        if !machine() {
+            print!("\x1b[s");
+            _ = io_stdout().flush();
+        }
 
         let tot_frames = chnks.iter().map(|c| c.end - c.start).sum();
 
@@ -294,7 +398,11 @@ impl ProgsTrack {
         });
 
         let disp = Arc::clone(&inner);
-        let handle = spawn(move || display_loop(&disp));
+        let handle = if machine() {
+            spawn(move || machine_loop(&disp))
+        } else {
+            spawn(move || display_loop(&disp))
+        };
 
         (Self { inner }, handle)
     }
@@ -659,6 +767,38 @@ fn parse_x265(s: &str) -> Option<(usize, f32, f32)> {
     let kbps = parts.next()?.split_whitespace().next()?.parse().ok()?;
 
     Some((cur, fps, kbps))
+}
+
+/// One `phase=enc` snapshot from the same counters the TUI draws from.
+fn machine_snap(s: &Shared) {
+    let frames = s.completed_frames.load(Relaxed);
+    let secs = s.start.elapsed().as_secs_f64();
+    let fps = if secs > 0.0 { frames as f64 / secs } else { 0.0 };
+    let tot_done = s.init_frames + frames;
+    let left = s.tot_frames.saturating_sub(tot_done);
+    let eta = if fps > 0.0 { (left as f64 / fps) as u64 } else { 0 };
+    emit(format_args!(
+        "phase=enc chunks={}/{} frames={tot_done}/{} fps={fps:.2} eta_s={eta} elapsed_s={} \
+         out_bytes={}",
+        s.completed.load(Relaxed),
+        s.tot_chnks,
+        s.tot_frames,
+        PRIOR_SECS.load(Relaxed) + secs as u64,
+        s.tot_sz.load(Relaxed),
+    ));
+}
+
+/// Machine-mode replacement for [`display_loop`]: same cadence, same stop
+/// protocol, but line records on stderr instead of the asm-drawn TUI.
+fn machine_loop(s: &Shared) {
+    loop {
+        sleep(Durat::from_millis(INTERVAL_MS));
+        if s.stop.load(Relaxed) {
+            break;
+        }
+        machine_snap(s);
+    }
+    machine_snap(s);
 }
 
 fn display_loop(s: &Shared) {

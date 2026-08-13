@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use std::time::Instant;
+use crate::clk::epoch;
 
 #[repr(C)]
 pub struct Ts {
@@ -8,11 +8,12 @@ pub struct Ts {
     nsec: i64,
 }
 
-static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-
+// Shares `clk::epoch` with `Mono::raw`, whose stamps the progress assembly
+// compares against this. Two independent origins would render a plausible but
+// meaningless ETA.
 #[unsafe(no_mangle)]
 extern "C" fn xav_plat_now(_clk: i32, out: *mut Ts) -> i32 {
-    let d = START.get_or_init(Instant::now).elapsed();
+    let d = epoch().elapsed();
     unsafe {
         (*out).sec = d.as_secs() as i64;
         (*out).nsec = i64::from(d.subsec_nanos());

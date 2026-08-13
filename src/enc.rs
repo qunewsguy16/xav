@@ -39,7 +39,7 @@ use crate::{
     path::Path,
     pipeline::Pipeline,
     process::Child,
-    progs::{ProgsTrack, Tracker, Watch},
+    progs::{ProgsTrack, Tracker, Watch, emit_chunk_done},
     svt::{
         EB_BUFFERFLAG_EOS, EB_ERROR_NONE, EbBufferHeaderType, EbComponentType,
         EbSvtAv1EncConfiguration, EbSvtIOFormat, svt_av1_enc_deinit, svt_av1_enc_deinit_handle,
@@ -407,6 +407,24 @@ impl TQCtx {
         state.search_min > state.search_max
     }
 
+    /// Has the CRF/score relationship stopped behaving monotonically?
+    ///
+    /// The search assumes one direction of travel, and bails out when a probe
+    /// contradicts it, because interpolating through a non-monotonic set gives
+    /// nonsense. A repeated CRF (product exactly zero) also counts, since it
+    /// carries no new information.
+    ///
+    /// The expected sign depends on metric polarity, exactly as in
+    /// [`Self::up_bounds`]: Butteraugli is a *distortion* measure that rises
+    /// with CRF, while SSIMU2 and CVVDP are *quality* measures that fall with
+    /// it. Treating both the same way makes the normal, healthy Butteraugli
+    /// case look non-monotonic and ends the search after two probes.
+    #[inline(always)]
+    fn nonmonotonic(&self, prev: &Probe, crf: f32, score: f32) -> bool {
+        let d = (prev.crf - crf) * (prev.score - score);
+        if self.use_butter { d <= 0.0 } else { d >= 0.0 }
+    }
+
     #[inline(always)]
     fn best_probe<'a>(&self, probes: &'a [Probe]) -> &'a Probe {
         unsafe {
@@ -452,6 +470,12 @@ fn complete_chnk(
     unsafe { mpsc_send(ctx.done_tx, 1) };
 
     let file_sz = metadata(&dst).unwrap_or(0);
+    emit_chunk_done(
+        chnk_idx,
+        chnk_frames,
+        file_sz,
+        Some((best.crf, best.score)),
+    );
     let comp = ChunkComp {
         idx: chnk_idx,
         frames: chnk_frames,
@@ -621,7 +645,7 @@ fn run_metric_worker(
             || tq_state
                 .probes
                 .iter()
-                .any(|p| (p.crf - crf) * (p.score - score) >= 0.0)
+                .any(|p| ctx.tq_ctx.nonmonotonic(p, crf, score))
             || ctx.tq_ctx.up_bounds(tq_state, score);
 
         tq_state.probes.push(Probe {
@@ -1118,7 +1142,9 @@ fn enc_tq_probe_sub(
         frames: pkg.frame_cnt,
     };
 
-    let cmd = make_enc_cmd(ctx.encoder, &cfg);
+    // std's Command::spawn takes &mut self; the freestanding Linux one takes &self.
+    #[cfg_attr(target_os = "linux", allow(unused_mut))]
+    let mut cmd = make_enc_cmd(ctx.encoder, &cfg);
     let mut child = cmd.spawn().unwrap_or_else(|e| fatal(e));
 
     let last_score = pkg
@@ -1179,6 +1205,7 @@ fn run_enc_worker(
                 ctx.encoder.extension()
             ));
             let file_sz = metadata(&out).unwrap_or(0);
+            emit_chunk_done(pkg.chnk.idx, pkg.frame_cnt, file_sz, None);
             let comp = ChunkComp {
                 idx: pkg.chnk.idx,
                 frames: pkg.frame_cnt,
@@ -1257,7 +1284,9 @@ fn enc_chnk_sub(
         frames: pkg.frame_cnt,
     };
 
-    let cmd = make_enc_cmd(ctx.encoder, &cfg);
+    // std's Command::spawn takes &mut self; the freestanding Linux one takes &self.
+    #[cfg_attr(target_os = "linux", allow(unused_mut))]
+    let mut cmd = make_enc_cmd(ctx.encoder, &cfg);
     let mut child = cmd.spawn().unwrap_or_else(|e| fatal(e));
 
     (ctx.watch_enc)(

@@ -13,15 +13,33 @@ set -Eeuo pipefail
 } || IS_MAC=false
 "${IS_MAC}" && LLVM_PREFIX="$(brew --prefix llvm)" && export PATH="${LLVM_PREFIX}/bin:${PATH}"
 
-has_nvidia() { grep -qx 0x10de /sys/bus/pci/devices/*/vendor 2> /dev/null; }
+has_nvidia() {
+        grep -qx 0x10de /sys/bus/pci/devices/*/vendor 2> /dev/null && return 0
+
+        # WSL2 does not expose the GPU on the virtual PCI bus, so the probe
+        # above finds nothing even on an NVIDIA machine and the build silently
+        # falls back to Vulkan. The driver is supplied by Windows and only
+        # nvidia-smi can see the device.
+        command -v nvidia-smi > /dev/null 2>&1 && nvidia-smi -L 2> /dev/null | grep -q '^GPU'
+}
 
 install_deps() {
         ((UID != 0)) && { for i in sudo doas; do command -v "${i}" > /dev/null 2>&1 && priv="${i}"; done; }
 
         pm="unknown"
-        for i in pacman dnf emerge brew; do command -v "${i}" > /dev/null 2>&1 && pm="${i}"; done
+        for i in apt-get pacman dnf emerge brew; do command -v "${i}" > /dev/null 2>&1 && pm="${i}"; done
 
         case "${pm}" in
+                "apt-get")
+                        pkgs=(
+                                build-essential nasm rustup clang lld llvm
+                                libclang-rt-dev autoconf automake libtool
+                                cmake ninja-build meson pkgconf ffmpeg curl git
+                        )
+                        has_nvidia && pkgs+=(nvidia-cuda-toolkit)
+                        ${priv:-} apt-get update
+                        ${priv:-} apt-get install -y "${pkgs[@]}"
+                        ;;
                 "pacman")
                         pkgs=(base-devel rustup nasm clang compiler-rt cmake llvm lld ninja meson ffmpeg curl gcc)
                         has_nvidia && pkgs+=(cuda)
@@ -161,7 +179,7 @@ detect_deps() {
         )
         while IFS= read -r d; do
                 CLANG_LIB_DIRS+=("${d}")
-        done < <(find /usr/lib/clang /usr/lib64/clang /usr/lib/llvm /usr/lib64/llvm -type d \( -name "linux" -o -name "darwin" -o -name "lib" \) 2> /dev/null || true)
+        done < <(find /usr/lib/clang /usr/lib64/clang /usr/lib/llvm* /usr/lib64/llvm* -type d \( -name "linux" -o -name "darwin" -o -name "lib" \) 2> /dev/null || true)
 
         ALL_STATIC_DIRS=("${SYS_LIB_DIRS[@]}" "${GCC_LIB_DIRS[@]}" "${CLANG_LIB_DIRS[@]}")
 
