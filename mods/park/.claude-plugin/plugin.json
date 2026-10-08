@@ -1,0 +1,9 @@
+{
+  "name": "park",
+  "version": "0.1.0",
+  "description": "Downhill parking: /park saves where you stopped, the next physical action and one open loop per project; the next session opens on it (Re-entry first).",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Brian Kowalenko"
+  }
+}

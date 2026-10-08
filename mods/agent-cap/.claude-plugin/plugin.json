@@ -1,0 +1,8 @@
+{
+  "name": "agent-cap",
+  "version": "0.1.0",
+  "description": "Caps how many subagents one turn may start (default 6) so a fan-out cannot burn a rate-limit window unasked; /agent-cap <n|off|status>.",
+  "author": {
+    "name": "Brian Kowalenko"
+  }
+}

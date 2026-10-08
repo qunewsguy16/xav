@@ -1,0 +1,8 @@
+{
+  "name": "bg-run",
+  "version": "0.1.0",
+  "description": "/bg <command> runs a long job (a cargo build, a render) in the background without a Claude turn: a status line while it runs, a toast when it exits, /bg-log for the last lines.",
+  "author": {
+    "name": "Brian Kowalenko"
+  }
+}

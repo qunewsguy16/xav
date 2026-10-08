@@ -1,0 +1,53 @@
+{
+  "name": "xav-mods",
+  "owner": {
+    "name": "Brian Kowalenko"
+  },
+  "plugins": [
+    {
+      "name": "agent-cap",
+      "source": "./mods/agent-cap",
+      "description": "Caps how many subagents one turn may start (default 6) so a fan-out cannot burn a rate-limit window unasked; /agent-cap <n|off|status>."
+    },
+    {
+      "name": "bg-run",
+      "source": "./mods/bg-run",
+      "description": "/bg <command> runs a long job (a cargo build, a render) in the background without a Claude turn: a status line while it runs, a toast when it exits, /bg-log for the last lines."
+    },
+    {
+      "name": "correction-log",
+      "source": "./mods/correction-log",
+      "description": "T13 correction-capture: when a prompt reads as a correction of the last answer, log it (date, project, your words, what was answered); /corrections dumps lines ready for STATE-trigger-observations."
+    },
+    {
+      "name": "guard-paths",
+      "source": "./mods/guard-paths",
+      "description": "Refuses edits to files Claude must never hand-edit: a skills manifest.json, .env files, .credentials.json; also a Bash command that writes to them."
+    },
+    {
+      "name": "limits-band",
+      "source": "./mods/limits-band",
+      "description": "One line above the prompt: context fill, 5-hour and 7-day rate-limit use, session cost, and the last turn's time, tool calls and subagents; a Compact button past 70% context and a toast at 85%/95% of any limit."
+    },
+    {
+      "name": "park",
+      "source": "./mods/park",
+      "description": "Downhill parking: /park saves where you stopped, the next physical action and one open loop per project; the next session opens on it (Re-entry first)."
+    },
+    {
+      "name": "rust-deny-guard",
+      "source": "./mods/rust-deny-guard",
+      "description": "In a crate whose Cargo.toml denies unwrap_used, refuses an Edit/Write of a .rs file that would fail the crate's deny-level lints (unwrap, expect, panic!, dbg!, eprintln!, str .to_string(), as _) before a slow build finds out."
+    },
+    {
+      "name": "trigger-router",
+      "source": "./mods/trigger-router",
+      "description": "Playbook triggers T1-T10 as code: when a prompt matches a phrasing, Claude reads a one-line routing hint; firings are logged for /triggers."
+    },
+    {
+      "name": "written-files",
+      "source": "./mods/written-files",
+      "description": "Keeps the list of files Claude edited or wrote this session; a dim line after each turn names what changed, and /written lists them all (so the park block and the state log can be written from facts)."
+    }
+  ]
+}

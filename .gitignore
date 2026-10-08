@@ -12,3 +12,5 @@
 !README.md
 !vship.mk
 !.gitignore
+!/mods/
+!/.claude-plugin/
