@@ -1,0 +1,8 @@
+{
+  "name": "rust-deny-guard",
+  "version": "0.1.0",
+  "description": "In a crate whose Cargo.toml denies unwrap_used, refuses an Edit/Write of a .rs file that would fail the crate's deny-level lints (unwrap, expect, panic!, dbg!, eprintln!, str .to_string(), as _) before a slow build finds out.",
+  "author": {
+    "name": "Brian Kowalenko"
+  }
+}

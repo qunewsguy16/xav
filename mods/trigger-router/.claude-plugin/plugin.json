@@ -1,0 +1,8 @@
+{
+  "name": "trigger-router",
+  "version": "0.1.0",
+  "description": "Playbook triggers T1-T10 as code: when a prompt matches a phrasing, Claude reads a one-line routing hint; firings are logged for /triggers.",
+  "author": {
+    "name": "Brian Kowalenko"
+  }
+}

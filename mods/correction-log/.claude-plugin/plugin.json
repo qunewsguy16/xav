@@ -1,0 +1,8 @@
+{
+  "name": "correction-log",
+  "version": "0.1.0",
+  "description": "T13 correction-capture: when a prompt reads as a correction of the last answer, log it (date, project, your words, what was answered); /corrections dumps lines ready for STATE-trigger-observations.",
+  "author": {
+    "name": "Brian Kowalenko"
+  }
+}

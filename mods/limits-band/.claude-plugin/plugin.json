@@ -1,0 +1,9 @@
+{
+  "name": "limits-band",
+  "version": "0.1.0",
+  "description": "One line above the prompt: context fill, 5-hour and 7-day rate-limit use, session cost, and the last turn's time, tool calls and subagents; a Compact button past 70% context and a toast at 85%/95% of any limit.",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Brian Kowalenko"
+  }
+}

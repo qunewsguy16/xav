@@ -1,0 +1,8 @@
+{
+  "name": "guard-paths",
+  "version": "0.1.0",
+  "description": "Refuses edits to files Claude must never hand-edit: a skills manifest.json, .env files, .credentials.json; also a Bash command that writes to them.",
+  "author": {
+    "name": "Brian Kowalenko"
+  }
+}

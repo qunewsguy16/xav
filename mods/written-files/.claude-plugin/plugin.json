@@ -1,0 +1,9 @@
+{
+  "name": "written-files",
+  "version": "0.1.0",
+  "description": "Keeps the list of files Claude edited or wrote this session; a dim line after each turn names what changed, and /written lists them all (so the park block and the state log can be written from facts).",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "Brian Kowalenko"
+  }
+}
